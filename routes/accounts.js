@@ -1,0 +1,651 @@
+const express = require('express');
+const { body, param, validationResult } = require('express-validator');
+const { pool } = require('../config/database');
+const { authenticateToken } = require('../middleware/auth');
+const { asyncHandler } = require('../middleware/errorHandler');
+
+const router = express.Router();
+
+// Validation rules for account creation
+const createAccountValidation = [
+    body('account_name')
+        .trim()
+        .isLength({ min: 1, max: 100 })
+        .withMessage('Account name must be between 1 and 100 characters'),
+    body('account_type_id')
+        .isInt({ min: 1 })
+        .withMessage('Valid account type ID is required'),
+    body('initial_balance')
+        .optional()
+        .isNumeric()
+        .withMessage('Initial balance must be a number'),
+    body('account_number')
+        .optional()
+        .isLength({ max: 50 })
+        .withMessage('Account number must be 50 characters or less'),
+    body('description')
+        .optional()
+        .isLength({ max: 255 })
+        .withMessage('Description must be 255 characters or less')
+];
+
+// Validation rules for account updates
+const updateAccountValidation = [
+    param('id')
+        .isInt({ min: 1 })
+        .withMessage('Valid account ID is required'),
+    body('account_name')
+        .optional()
+        .trim()
+        .isLength({ min: 1, max: 100 })
+        .withMessage('Account name must be between 1 and 100 characters'),
+    body('description')
+        .optional()
+        .isLength({ max: 255 })
+        .withMessage('Description must be 255 characters or less')
+];
+
+// Get all account types (for dropdown in account creation)
+router.get('/types', authenticateToken, asyncHandler(async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+        await client.query('SET search_path TO finance, public');
+        await client.query(`SET app.current_user_id = '${req.user.user_id}'`);
+        
+        const result = await client.query(`
+            SELECT type_id, type_name, description, allows_negative_balance, is_asset
+            FROM finance.account_types
+            ORDER BY type_name
+        `);
+        
+        res.json({
+            success: true,
+            data: result.rows.map(type => ({
+                id: type.type_id,
+                name: type.type_name,
+                description: type.description,
+                allowsNegative: type.allows_negative_balance,
+                isAsset: type.is_asset
+            }))
+        });
+        
+    } catch (error) {
+        console.error('Account Types API Error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to load account types'
+        });
+    } finally {
+        client.release();
+    }
+}));
+
+// Get all user's accounts with personalized data
+router.get('/', authenticateToken, asyncHandler(async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+        await client.query('SET search_path TO finance, public');
+        await client.query(`SET app.current_user_id = '${req.user.user_id}'`);
+        
+        const userId = req.user.user_id;
+        
+        const result = await client.query(`
+            SELECT 
+                a.account_id,
+                a.account_name,
+                a.current_balance,
+                a.date_created,
+                a.account_number,
+                a.notes,
+                at.type_name,
+                at.allows_negative_balance,
+                at.is_asset,
+                COUNT(t.transaction_id) as transaction_count,
+                MAX(t.transaction_date) as last_transaction_date,
+                COALESCE(SUM(CASE WHEN t.transaction_date >= DATE_TRUNC('month', CURRENT_DATE) 
+                    AND t.amount > 0 THEN t.amount ELSE 0 END), 0) as monthly_income,
+                COALESCE(SUM(CASE WHEN t.transaction_date >= DATE_TRUNC('month', CURRENT_DATE) 
+                    AND t.amount < 0 THEN ABS(t.amount) ELSE 0 END), 0) as monthly_expenses
+            FROM finance.accounts a
+            JOIN finance.account_types at ON a.type_id = at.type_id
+            LEFT JOIN finance.transactions t ON a.account_id = t.account_id
+            WHERE a.user_id = $1 
+            GROUP BY a.account_id, a.account_name, a.current_balance, a.date_created, 
+                     a.account_number, a.notes, at.type_name, at.allows_negative_balance, at.is_asset
+            ORDER BY at.type_name, a.account_name
+        `, [userId]);
+
+        res.json({
+            success: true,
+            data: result.rows.map(account => ({
+                id: account.account_id,
+                name: account.account_name,
+                type: account.type_name,
+                balance: parseFloat(account.current_balance),
+                accountNumber: account.account_number,
+                description: account.notes,
+                isAsset: account.is_asset,
+                allowsNegative: account.allows_negative_balance,
+                transactionCount: parseInt(account.transaction_count),
+                lastTransaction: account.last_transaction_date,
+                monthlyIncome: parseFloat(account.monthly_income),
+                monthlyExpenses: parseFloat(account.monthly_expenses),
+                createdAt: account.date_created
+            }))
+        });
+        
+    } catch (error) {
+        console.error('User Accounts API Error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to load accounts'
+        });
+    } finally {
+        client.release();
+    }
+}));
+
+// Get specific account by ID (with full details and recent transactions)
+router.get('/:id', authenticateToken, [
+    param('id').isInt({ min: 1 }).withMessage('Valid account ID is required')
+], asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Validation errors',
+            errors: errors.array()
+        });
+    }
+    
+    const client = await pool.connect();
+    
+    try {
+        await client.query('SET search_path TO finance, public');
+        await client.query(`SET app.current_user_id = '${req.user.user_id}'`);
+        
+        const userId = req.user.user_id;
+        const accountId = req.params.id;
+
+        // Get account details with type information
+        const accountResult = await client.query(`
+            SELECT 
+                a.account_id,
+                a.account_name,
+                a.current_balance,
+                a.date_created,
+                a.account_number,
+                a.description,
+                at.type_name,
+                at.allows_negative_balance,
+                at.is_asset,
+                COUNT(t.transaction_id) as transaction_count,
+                MAX(t.transaction_date) as last_transaction_date
+            FROM finance.accounts a
+            JOIN finance.account_types at ON a.account_type_id = at.type_id
+            LEFT JOIN finance.transactions t ON a.account_id = t.account_id
+            WHERE a.user_id = $1 AND a.account_id = $2
+            GROUP BY a.account_id, a.account_name, a.current_balance, a.date_created, 
+                     a.account_number, a.description, at.type_name, at.allows_negative_balance, at.is_asset
+        `, [userId, accountId]);
+
+        if (accountResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Account not found or does not belong to user'
+            });
+        }
+
+        // Get recent transactions for this account
+        const transactionsResult = await client.query(`
+            SELECT 
+                t.transaction_id,
+                t.amount,
+                t.description,
+                t.transaction_date,
+                t.notes,
+                c.category_name,
+                c.category_icon
+            FROM finance.transactions t
+            LEFT JOIN finance.categories c ON t.category_id = c.category_id
+            WHERE t.account_id = $1
+            ORDER BY t.transaction_date DESC, t.transaction_id DESC
+            LIMIT 10
+        `, [accountId]);
+
+        const account = accountResult.rows[0];
+        
+        res.json({
+            success: true,
+            data: {
+                id: account.account_id,
+                name: account.account_name,
+                type: account.type_name,
+                balance: parseFloat(account.current_balance),
+                accountNumber: account.account_number,
+                description: account.description,
+                isAsset: account.is_asset,
+                allowsNegative: account.allows_negative_balance,
+                transactionCount: parseInt(account.transaction_count),
+                lastTransactionDate: account.last_transaction_date,
+                createdAt: account.date_created,
+                recentTransactions: transactionsResult.rows.map(transaction => ({
+                    id: transaction.transaction_id,
+                    amount: parseFloat(transaction.amount),
+                    description: transaction.description,
+                    date: transaction.transaction_date,
+                    notes: transaction.notes,
+                    category: transaction.category_name,
+                    categoryIcon: transaction.category_icon,
+                    type: parseFloat(transaction.amount) >= 0 ? 'income' : 'expense'
+                }))
+            }
+        });
+        
+    } catch (error) {
+        console.error('Account Details API Error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to load account details'
+        });
+    } finally {
+        client.release();
+    }
+}));
+
+// Create new account
+router.post('/', authenticateToken, [
+    body('accountName')
+        .trim()
+        .notEmpty()
+        .withMessage('Account name is required')
+        .isLength({ min: 1, max: 255 })
+        .withMessage('Account name must be between 1 and 255 characters'),
+    body('accountTypeId')
+        .isInt({ min: 1 })
+        .withMessage('Valid account type ID is required'),
+    body('initialBalance')
+        .optional()
+        .isDecimal({ decimal_digits: '0,2' })
+        .withMessage('Initial balance must be a valid amount (max 2 decimal places)'),
+    body('description')
+        .optional()
+        .isLength({ max: 1000 })
+        .withMessage('Description cannot exceed 1000 characters'),
+    body('accountNumber')
+        .optional()
+        .isLength({ max: 50 })
+        .withMessage('Account number cannot exceed 50 characters')
+], asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Validation errors',
+            errors: errors.array()
+        });
+    }
+    
+    const client = await pool.connect();
+    
+    try {
+        await client.query('SET search_path TO finance, public');
+        await client.query(`SET app.current_user_id = '${req.user.user_id}'`);
+        
+        const userId = req.user.user_id;
+        const { accountName, accountTypeId, initialBalance = 0, description, accountNumber } = req.body;
+
+        // Check if account type exists and get its details
+        const accountTypeResult = await client.query(`
+            SELECT type_name, allows_negative_balance, is_asset 
+            FROM finance.account_types 
+            WHERE type_id = $1
+        `, [accountTypeId]);
+
+        if (accountTypeResult.rows.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid account type selected'
+            });
+        }
+
+        const accountType = accountTypeResult.rows[0];
+
+        // Check if account name is unique for this user
+        const existingAccount = await client.query(`
+            SELECT account_id FROM finance.accounts 
+            WHERE user_id = $1 AND LOWER(account_name) = LOWER($2)
+        `, [userId, accountName]);
+
+        if (existingAccount.rows.length > 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Account name already exists for this user'
+            });
+        }
+
+        // Validate initial balance for account type
+        if (parseFloat(initialBalance) < 0 && !accountType.allows_negative_balance) {
+            return res.status(400).json({
+                success: false,
+                message: 'Account type "' + accountType.type_name + '" does not allow negative balances'
+            });
+        }
+
+        // Create the account
+        const result = await client.query(`
+            INSERT INTO finance.accounts (user_id, account_name, type_id, current_balance, opening_balance, notes, account_number)
+            VALUES ($1, $2, $3, $4, $4, $5, $6)
+            RETURNING account_id, account_name, current_balance, date_created
+        `, [userId, accountName, accountTypeId, initialBalance, description, accountNumber]);
+
+        const newAccount = result.rows[0];
+
+        res.status(201).json({
+            success: true,
+            message: 'Account created successfully',
+            data: {
+                id: newAccount.account_id,
+                name: newAccount.account_name,
+                type: accountType.type_name,
+                balance: parseFloat(newAccount.current_balance),
+                createdAt: newAccount.date_created,
+                isAsset: accountType.is_asset,
+                allowsNegative: accountType.allows_negative_balance
+            }
+        });
+        
+    } catch (error) {
+        console.error('Account Creation Error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to create account'
+        });
+    } finally {
+        client.release();
+    }
+}));
+
+// Update account
+router.put('/:id', authenticateToken, [
+    param('id').isInt({ min: 1 }).withMessage('Valid account ID is required'),
+    body('accountName')
+        .optional()
+        .trim()
+        .isLength({ min: 1, max: 255 })
+        .withMessage('Account name must be between 1 and 255 characters'),
+    body('description')
+        .optional()
+        .isLength({ max: 1000 })
+        .withMessage('Description cannot exceed 1000 characters'),
+    body('accountNumber')
+        .optional()
+        .isLength({ max: 50 })
+        .withMessage('Account number cannot exceed 50 characters')
+], asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Validation errors',
+            errors: errors.array()
+        });
+    }
+    
+    const client = await pool.connect();
+    
+    try {
+        await client.query('SET search_path TO finance, public');
+        
+        const userId = req.user.user_id;
+        const accountId = req.params.id;
+        const { accountName, description, accountNumber } = req.body;
+
+        // Verify account ownership and get current details
+        const accountCheck = await client.query(`
+            SELECT a.account_id, a.account_name, a.current_balance, at.type_name
+            FROM finance.accounts a
+            JOIN finance.account_types at ON a.account_type_id = at.type_id
+            WHERE a.user_id = $1 AND a.account_id = $2
+        `, [userId, accountId]);
+
+        if (accountCheck.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Account not found or does not belong to user'
+            });
+        }
+
+        // Check if new name already exists for this user (excluding current account)
+        if (accountName && accountName !== accountCheck.rows[0].account_name) {
+            const existingAccount = await client.query(`
+                SELECT account_id FROM finance.accounts 
+                WHERE user_id = $1 AND LOWER(account_name) = LOWER($2) AND account_id != $3
+            `, [userId, accountName, accountId]);
+
+            if (existingAccount.rows.length > 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Account name already exists for this user'
+                });
+            }
+        }
+
+        // Build update query dynamically
+        const updateFields = [];
+        const updateValues = [];
+        let hasUpdates = false;
+
+        if (accountName !== undefined) {
+            updateFields.push('account_name = $' + (updateFields.length + 1));
+            updateValues.push(accountName);
+            hasUpdates = true;
+        }
+
+        if (description !== undefined) {
+            updateFields.push('description = $' + (updateFields.length + 1));
+            updateValues.push(description);
+            hasUpdates = true;
+        }
+
+        if (accountNumber !== undefined) {
+            updateFields.push('account_number = $' + (updateFields.length + 1));
+            updateValues.push(accountNumber);
+            hasUpdates = true;
+        }
+
+        if (!hasUpdates) {
+            return res.status(400).json({
+                success: false,
+                message: 'No valid fields to update'
+            });
+        }
+
+        // Add account_id for WHERE clause
+        updateValues.push(accountId);
+        
+        const updateQuery = 'UPDATE finance.accounts SET ' + updateFields.join(', ') + 
+                           ' WHERE account_id = $' + updateValues.length + 
+                           ' RETURNING account_id, account_name, description, account_number, current_balance';
+
+        const result = await client.query(updateQuery, updateValues);
+        const currentAccount = accountCheck.rows[0];
+
+        res.json({
+            success: true,
+            message: 'Account updated successfully',
+            data: {
+                id: result.rows[0].account_id,
+                name: result.rows[0].account_name,
+                type: currentAccount.type_name,
+                balance: parseFloat(result.rows[0].current_balance),
+                description: result.rows[0].description,
+                accountNumber: result.rows[0].account_number
+            }
+        });
+        
+    } catch (error) {
+        console.error('Account Update Error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to update account'
+        });
+    } finally {
+        client.release();
+    }
+}));
+
+// Delete account
+router.delete('/:id', authenticateToken, [
+    param('id').isInt({ min: 1 }).withMessage('Valid account ID is required')
+], asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Validation errors',
+            errors: errors.array()
+        });
+    }
+    
+    const client = await pool.connect();
+    
+    try {
+        await client.query('SET search_path TO finance, public');
+        
+        const userId = req.user.user_id;
+        const accountId = req.params.id;
+
+        // Verify account ownership and get account details
+        const accountCheck = await client.query(
+            'SELECT account_id, account_name, current_balance FROM finance.accounts WHERE user_id = $1 AND account_id = $2',
+            [userId, accountId]
+        );
+
+        if (accountCheck.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Account not found or does not belong to user'
+            });
+        }
+
+        // Check if account has transactions
+        const transactionCheck = await client.query(
+            'SELECT COUNT(*) as transaction_count FROM finance.transactions WHERE account_id = $1',
+            [accountId]
+        );
+
+        const transactionCount = parseInt(transactionCheck.rows[0].transaction_count);
+
+        if (transactionCount > 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot delete account with ' + transactionCount + ' transactions. Please delete all transactions first.'
+            });
+        }
+
+        // Check if account has non-zero balance
+        const currentBalance = parseFloat(accountCheck.rows[0].current_balance);
+        if (currentBalance !== 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot delete account with non-zero balance. Current balance: $' + currentBalance.toFixed(2)
+            });
+        }
+
+        // Delete account
+        await client.query('DELETE FROM finance.accounts WHERE account_id = $1', [accountId]);
+
+        res.json({
+            success: true,
+            message: 'Account deleted successfully',
+            data: {
+                accountName: accountCheck.rows[0].account_name
+            }
+        });
+        
+    } catch (error) {
+        console.error('Account Delete Error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to delete account'
+        });
+    } finally {
+        client.release();
+    }
+}));
+
+// Get account transaction summary (basic stats endpoint)
+router.get('/:id/summary', authenticateToken, [
+    param('id').isInt({ min: 1 }).withMessage('Valid account ID is required')
+], asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({
+            success: false,
+            message: 'Validation errors',
+            errors: errors.array()
+        });
+    }
+    
+    const client = await pool.connect();
+    
+    try {
+        await client.query('SET search_path TO finance, public');
+        
+        const userId = req.user.user_id;
+        const accountId = req.params.id;
+
+        // Verify account ownership
+        const accountCheck = await client.query(
+            'SELECT account_id, account_name, current_balance FROM finance.accounts WHERE user_id = $1 AND account_id = $2',
+            [userId, accountId]
+        );
+
+        if (accountCheck.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Account not found or does not belong to user'
+            });
+        }
+
+        // Get transaction summary for the account
+        const summaryResult = await client.query(
+            'SELECT COUNT(*) as total_transactions, ' +
+            'SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as total_income, ' +
+            'SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END) as total_expenses, ' +
+            'MAX(transaction_date) as last_transaction_date ' +
+            'FROM finance.transactions WHERE account_id = $1',
+            [accountId]
+        );
+
+        const account = accountCheck.rows[0];
+        const summary = summaryResult.rows[0];
+
+        res.json({
+            success: true,
+            data: {
+                accountId: account.account_id,
+                accountName: account.account_name,
+                currentBalance: parseFloat(account.current_balance),
+                totalTransactions: parseInt(summary.total_transactions),
+                totalIncome: parseFloat(summary.total_income || 0),
+                totalExpenses: parseFloat(summary.total_expenses || 0),
+                lastTransactionDate: summary.last_transaction_date
+            }
+        });
+        
+    } catch (error) {
+        console.error('Account Summary Error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get account summary'
+        });
+    } finally {
+        client.release();
+    }
+}));
+
+module.exports = router;
