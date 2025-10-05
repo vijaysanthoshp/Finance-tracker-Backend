@@ -43,15 +43,24 @@ app.use(helmet({
 }));
 
 // CORS configuration - Allow multiple origins for development
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5000',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5000',
+  process.env.https://proud-water-01e0f3800.2.azurestaticapps.net
+];
 app.use(cors({
-    origin: [
-        'http://localhost:3000',
-        'http://localhost:5000', 
-        'http://127.0.0.1:3000',
-        'http://127.0.0.1:5000',
-        null // Allow file:// protocol (when opening HTML files directly)
-    ],
-    credentials: true
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS not allowed for this origin: ' + origin));
+    }
+  },
+  credentials: true
 }));
 
 // Rate limiting
